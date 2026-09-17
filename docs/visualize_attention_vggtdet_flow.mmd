@@ -1,0 +1,49 @@
+%% ============================================================================
+%% visualize_attention_vggtdet.py 流程图（Mermaid）
+%% 预览方式：VS Code 装 Mermaid 插件，或 https://mermaid.live 粘贴本文件
+%% ============================================================================
+
+flowchart TD
+    A(["main() 入口"]) --> A1["parse_args<br/>解析命令行参数"]
+    A1 --> B["collect_image_paths<br/>文件夹/文件 → 排序图片路径"]
+    B --> C["preprocess_images<br/>crop/pad → 518 基准<br/>返回 images + 每帧 transform"]
+    C --> D["load_model<br/>本地权重 或 HF 下载 VGGT-1B<br/>assign=True 省内存"]
+    D --> E["parse_layer<br/>'f0'/'g23' → (frame/global, idx)"]
+    E --> F["VGGTDetAttentionCapture 进入上下文<br/>①挂钩目标层 forward<br/>②替换 F.sdpa"]
+    F --> G["agg(images) 前向<br/>目标层内 sdpa 被拦截<br/>分块累积列和 acc(B,N)"]
+    G --> H["退出上下文<br/>恢复原始 forward / sdpa"]
+    H --> I{"capture._acc 为空?"}
+    I -- 是 --> E1["RuntimeError: 层无效/未捕获"]
+    I -- 否 --> J["saliency_maps<br/>acc/(H·N) → 丢特殊 token<br/>→ (S, gh, gw)"]
+    J --> K["normalize_maps<br/>逐帧 minmax / percentile"]
+    K --> L{"--save-npz?"}
+    L -- 是 --> L1["np.savez 保存原始 maps"]
+    L -- 否 --> M
+    L1 --> M{"--frame 指定?"}
+    M -- 是 --> N1["render_single<br/>单帧双栏图"]
+    M -- 否 --> N2["render_grid<br/>2×S 网格"]
+    N1 --> O(["输出 PNG"])
+    N2 --> O
+
+%% ============================================================================
+%% 捕获机制（钩子）局部流程图
+%% ============================================================================
+
+flowchart LR
+    subgraph Model["模型前向（一次 agg(images)）"]
+        B0["进入 f0 块 frame_blocks[0]"]
+        B1["attn.forward = tagged_forward<br/>将 _current 置 True"]
+        B2["Attention.forward 内部<br/>q,k,v 分头"]
+        B3["F.scaled_dot_product_attention(q,k,v)<br/>被 sdpa_wrapper 拦截"]
+    end
+    subgraph Capture["VGGTDetAttentionCapture"]
+        C0{"sdpa_wrapper 检测<br/>_current 且 q.dim()==4 ?"}
+        C0 -- 是 --> C1["_capture 分块 256 行<br/>softmax(QKᵀ/√D)<br/>head 求和 + query 行求和"]
+        C1 --> C2["acc(B,N) float32 累积"]
+        C0 -- 否(其他层/调用) --> C3["原样放行原 sdpa"]
+        C2 --> C3
+    end
+    B1 --> B2 --> B3
+    B3 --> C0
+    C3 --> D["attn 输出正常返回<br/>_current 恢复为 None<br/>继续下一块 f1, g0, g1 ..."]
+    C2 --> E["exit 时恢复 forward/sdpa<br/>main 里读取 _acc 生成 saliency"]
